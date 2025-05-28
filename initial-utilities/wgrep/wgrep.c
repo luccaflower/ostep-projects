@@ -11,6 +11,7 @@ void grep(FILE *file, char *term) {
       printf("%s", line);
     }
   }
+  free(line);
 }
 int main(int argc, char *argv[]) {
   if (argc < 2) {
