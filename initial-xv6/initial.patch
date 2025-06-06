@@ -1,0 +1,101 @@
+diff --git a/defs.h b/defs.h
+index 82fb982..9ce54ac 100644
+--- a/defs.h
++++ b/defs.h
+@@ -33,6 +33,7 @@ void            fileinit(void);
+ int             fileread(struct file*, char*, int n);
+ int             filestat(struct file*, struct stat*);
+ int             filewrite(struct file*, char*, int n);
++int             getreadcount(void);
+ 
+ // fs.c
+ void            readsb(int dev, struct superblock *sb);
+diff --git a/file.c b/file.c
+index 24b32c2..25e3a4e 100644
+--- a/file.c
++++ b/file.c
+@@ -154,4 +154,3 @@ filewrite(struct file *f, char *addr, int n)
+   }
+   panic("filewrite");
+ }
+-
+diff --git a/syscall.c b/syscall.c
+index ee85261..c067da8 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_getreadcount(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getreadcount] sys_getreadcount,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..c5ebb23 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getreadcount 22
+diff --git a/sysfile.c b/sysfile.c
+index bfe61b7..c7d9c4d 100644
+--- a/sysfile.c
++++ b/sysfile.c
+@@ -66,18 +66,25 @@ sys_dup(void)
+   return fd;
+ }
+ 
++static volatile int readcount = 0;
+ int
+ sys_read(void)
+ {
+   struct file *f;
+   int n;
+   char *p;
++  readcount++;
+ 
+   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argptr(1, &p, n) < 0)
+     return -1;
+   return fileread(f, p, n);
+ }
+ 
++int
++sys_getreadcount(void) {
++    return readcount;
++}
++
+ int
+ sys_write(void)
+ {
+diff --git a/user.h b/user.h
+index 4f99c52..7886468 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getreadcount(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..7af84de 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getreadcount)
