@@ -9,11 +9,12 @@
 #include <unistd.h>
 
 #define MAXARGS (128)
-#define PATHC (2)
 #define MAXBUF (512)
 
 extern char **environ;
-static const char *path[] = {"/bin/", "/usr/bin/"};
+static size_t pathc = 1;
+static char *default_path = "/usr/bin/";
+static char **path;
 
 void unix_error(char *message, int err) {
   fprintf(stderr, "%s: %s\n", message, strerror(err));
@@ -44,6 +45,31 @@ FILE *Fopen(char *path, char *mode) {
   return fd;
 }
 
+void update_path(int argc, char **argv) {
+  for (size_t i = 0; i < pathc; i++) {
+    if (path[i] != default_path) {
+      free(path[i]);
+    }
+  }
+  if (path) {
+    free(path);
+  }
+  size_t len = argc - 1;
+  if (!len) {
+    path = NULL;
+    pathc = 0;
+  } else {
+    path = malloc(len * sizeof(*path));
+    for (size_t i = 0; i < len; i++) {
+      char *entry = malloc(strlen(argv[i] + 2));
+      strcpy(entry, argv[i + 1]);
+      strcat(entry, "/");
+      path[i] = entry;
+    }
+    pathc = len;
+  }
+}
+
 bool builtin_cmd(int argc, char **argv) {
   char *cmd = argv[0];
   if (!strcmp(cmd, "exit")) {
@@ -63,22 +89,30 @@ bool builtin_cmd(int argc, char **argv) {
       }
     }
     return true;
+  } else if (!strcmp(cmd, "path")) {
+    update_path(argc, argv);
+    return true;
   }
   return false;
 }
 
 void run_exec(char **argv) {
+  if (!path) {
+    cmd_error();
+    return;
+  }
   if (Fork()) {
     int status;
     wait(&status);
   } else {
     char cmd[MAXBUF];
-    for (size_t i = 0; i < PATHC; i++) {
+    for (size_t i = 0; i < pathc; i++) {
       strcpy(cmd, path[i]);
       size_t prefix_len = strlen(cmd);
       strncat(cmd, argv[0], MAXBUF - prefix_len);
       if (!access(cmd, X_OK)) {
         Execve(cmd, argv);
+        return;
       }
     }
     cmd_error();
@@ -106,6 +140,8 @@ int main(int argc, char *argv[]) {
   size_t buf_size;
   ssize_t n_read;
   bool interactive;
+  path = malloc(sizeof(*path));
+  path[0] = default_path;
 
   FILE *input;
   if (argc >= 2) {
