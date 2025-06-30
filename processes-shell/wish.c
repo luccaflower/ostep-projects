@@ -96,17 +96,24 @@ bool builtin_cmd(int argc, char **argv) {
   return false;
 }
 
-void run_exec(char **argv) {
+void run_exec(char **argv, char *redirect) {
   if (!path) {
     cmd_error();
     return;
   }
   if (Fork()) {
-    int status;
-    wait(&status);
+    wait(NULL);
   } else {
     char cmd[MAXBUF];
     for (size_t i = 0; i < pathc; i++) {
+      if (redirect) {
+        FILE *new_stdout = fopen(redirect, "w");
+        if (!new_stdout) {
+          cmd_error();
+          exit(1);
+        }
+        dup2(fileno(new_stdout), 1);
+      }
       strcpy(cmd, path[i]);
       size_t prefix_len = strlen(cmd);
       strncat(cmd, argv[0], MAXBUF - prefix_len);
@@ -121,17 +128,25 @@ void run_exec(char **argv) {
 
 void eval(char *line) {
   int argc;
-  char *token;
+
+  char *cmd = strsep(&line, ">");
+  char *redirect = line;
+  // remove trailing whitespace
+  if (redirect) {
+    cmd[strlen(cmd) - 1] = '\0';
+  }
+
+  char *arg;
   char *argv[MAXARGS];
-  for (argc = 0; (token = strsep(&line, " ")); argc++) {
-    argv[argc] = token;
+  for (argc = 0; (arg = strsep(&cmd, " ")); argc++) {
+    argv[argc] = arg;
   }
   if (argv[0] == NULL) {
     return;
   }
   argv[argc] = NULL;
   if (!builtin_cmd(argc, argv)) {
-    run_exec(argv);
+    run_exec(argv, redirect);
   }
 }
 
