@@ -21,7 +21,21 @@ void unix_error(char *message, int err) {
   exit(1);
 }
 
-void cmd_error(void) { fputs("An error has occurred\n", stderr); }
+void *Malloc(size_t size) {
+  void *p = malloc(size);
+  if (!p) {
+    unix_error("malloc", errno);
+  }
+  return p;
+}
+
+void *Realloc(void *p, size_t size) {
+  p = realloc(p, size);
+  if (!p) {
+    unix_error("realloc", errno);
+  }
+  return p;
+}
 
 void Execve(char *cmd, char **argv) {
   if (execve(cmd, argv, environ)) {
@@ -37,14 +51,15 @@ pid_t Fork() {
   return pid;
 }
 
+void cmd_error(void) { fputs("An error has occurred\n", stderr); }
 FILE *Fopen(char *path, char *mode) {
   FILE *fd;
   if (!(fd = fopen(path, mode))) {
-    unix_error("fopen", errno);
+    cmd_error();
+    exit(1);
   }
   return fd;
 }
-
 void update_path(int argc, char **argv) {
   for (size_t i = 0; i < pathc; i++) {
     if (path[i] != default_path) {
@@ -59,7 +74,7 @@ void update_path(int argc, char **argv) {
     path = NULL;
     pathc = 0;
   } else {
-    path = malloc(len * sizeof(*path));
+    path = Malloc(len * sizeof(*path));
     for (size_t i = 0; i < len; i++) {
       char *entry = malloc(strlen(argv[i] + 2));
       strcpy(entry, argv[i + 1]);
@@ -126,14 +141,35 @@ void run_exec(char **argv, char *redirect) {
   }
 }
 
+void trim(char **s) {
+  while (**s == ' ') {
+    (*s)++;
+  }
+  int i = strlen(*s) - 1;
+  while ((*s)[i] == ' ' && i >= 0) {
+    (*s)[i] = 0;
+  }
+}
 void eval(char *line) {
   int argc;
 
   char *cmd = strsep(&line, ">");
+  trim(&cmd);
+  if (!strcmp(cmd, "")) {
+    cmd_error();
+    return;
+  }
   char *redirect = line;
-  // remove trailing whitespace
   if (redirect) {
-    cmd[strlen(cmd) - 1] = '\0';
+    if (!strcmp(redirect, "")) {
+      cmd_error();
+      return;
+    }
+    trim(&redirect);
+    if (strchr(redirect, ' ')) {
+      cmd_error();
+      return;
+    }
   }
 
   char *arg;
@@ -162,11 +198,16 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     interactive = false;
     input = Fopen(argv[1], "r");
+    if (fgetc(input) == EOF) {
+      cmd_error();
+      exit(1);
+    } else {
+      rewind(input);
+    }
   } else {
     interactive = true;
     input = stdin;
   }
-
   while (1) {
     if (interactive) {
       printf("wish> ");
