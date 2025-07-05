@@ -111,13 +111,13 @@ bool builtin_cmd(int argc, char **argv) {
   return false;
 }
 
-void run_exec(char **argv, char *redirect) {
+int run_exec(char **argv, char *redirect) {
   if (!path) {
     cmd_error();
-    return;
+    return 0;
   }
   if (Fork()) {
-    wait(NULL);
+    return 1;
   } else {
     char cmd[MAXBUF];
     for (size_t i = 0; i < pathc; i++) {
@@ -134,10 +134,11 @@ void run_exec(char **argv, char *redirect) {
       strncat(cmd, argv[0], MAXBUF - prefix_len);
       if (!access(cmd, X_OK)) {
         Execve(cmd, argv);
-        return;
+        exit(1);
       }
     }
     cmd_error();
+    exit(1);
   }
 }
 
@@ -148,41 +149,54 @@ void trim(char **s) {
   int i = strlen(*s) - 1;
   while ((*s)[i] == ' ' && i >= 0) {
     (*s)[i] = 0;
+    i--;
   }
 }
 void eval(char *line) {
-  int argc;
+  char *job;
+  int jobs = 0;
+  while ((job = strsep(&line, "&"))) {
+    trim(&job);
+    if (!strcmp(job, "")) {
+      continue;
+    }
 
-  char *cmd = strsep(&line, ">");
-  trim(&cmd);
-  if (!strcmp(cmd, "")) {
-    cmd_error();
-    return;
-  }
-  char *redirect = line;
-  if (redirect) {
-    if (!strcmp(redirect, "")) {
+    char *cmd = strsep(&job, ">");
+    trim(&cmd);
+    if (!strcmp(cmd, "")) {
       cmd_error();
       return;
     }
-    trim(&redirect);
-    if (strchr(redirect, ' ')) {
-      cmd_error();
+    char *redirect = job;
+    if (redirect) {
+      if (!strcmp(redirect, "")) {
+        cmd_error();
+        return;
+      }
+      trim(&redirect);
+      if (strchr(redirect, ' ')) {
+        cmd_error();
+        return;
+      }
+    }
+
+    char *arg;
+    char *argv[MAXARGS];
+    int argc;
+    for (argc = 0; (arg = strsep(&cmd, " ")); argc++) {
+      argv[argc] = arg;
+    }
+    if (argv[0] == NULL) {
       return;
     }
+    argv[argc] = NULL;
+    if (!builtin_cmd(argc, argv)) {
+      jobs += run_exec(argv, redirect);
+    }
   }
-
-  char *arg;
-  char *argv[MAXARGS];
-  for (argc = 0; (arg = strsep(&cmd, " ")); argc++) {
-    argv[argc] = arg;
-  }
-  if (argv[0] == NULL) {
-    return;
-  }
-  argv[argc] = NULL;
-  if (!builtin_cmd(argc, argv)) {
-    run_exec(argv, redirect);
+  while (jobs) {
+    wait(NULL);
+    jobs--;
   }
 }
 
