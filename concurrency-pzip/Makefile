@@ -1,6 +1,9 @@
-CFLAGS = '-O2'
+CFLAGS += '-O2'
 pzip:
 
-.PHONY: test
+.PHONY: test clean
 test: pzip
 	./test-pzip.sh	
+
+clean:
+	rm -rf tests-out pzip

@@ -78,6 +78,44 @@ Malloc(size_t size)
     return ret;
 }
 
+struct WorkTask
+{
+    size_t len;
+    char out[];
+};
+
+struct WorkTask*
+zip(char* buf, size_t buf_len)
+{
+    struct WorkTask* task = Malloc(sizeof(*task) + 5 * buf_len);
+    char* out = task->out;
+    size_t cursor = 0;
+    size_t count = 0;
+    char current = '\0';
+    for (size_t i = 0; i < buf_len; i++) {
+        char c = buf[i];
+        if (c != current) {
+            if (count > 0) {
+                *(int*)(out + cursor) = count;
+                cursor += 4;
+                out[cursor++] = current;
+            }
+            current = c;
+            count = 1;
+        } else {
+            count++;
+        }
+    }
+    if (count > 0) {
+        *(int*)(out + cursor) = count;
+        cursor += 4;
+        out[cursor++] = current;
+    }
+
+    task->len = cursor;
+    return task;
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -86,36 +124,27 @@ main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    int count = 0;
-    char current = '\0';
-    char* out = Malloc(GB(4));
-    size_t cursor = 0;
+    struct WorkTask* tasks[argc - 1];
     for (size_t i = 1; i < argc; i++) {
         int fd = Open(argv[1], O_RDONLY);
         struct stat filestat;
         Fstat(fd, &filestat);
         char* buf = Mmap(NULL, filestat.st_size, PROT_READ, MAP_SHARED, fd, 0);
-        for (size_t i = 0; i < filestat.st_size; i++) {
-            char c = buf[i];
-            if (c != current) {
-                if (count > 0) {
-                    *(int*)(out + cursor) = count;
-                    cursor += 4;
-                    out[cursor++] = current;
-                }
-                current = c;
-                count = 1;
-            } else {
-                count++;
-            }
-        }
+        tasks[i - 1] = zip(buf, filestat.st_size);
         close(fd);
     }
-    if (count > 0) {
-        *(int*)(out + cursor) = count;
-        cursor += 4;
-        out[cursor++] = current;
+    size_t i = 0;
+    for (; i < argc - 2; i++) {
+        struct WorkTask* task1 = tasks[i];
+        struct WorkTask* task2 = tasks[i + 1];
+        if (task1->out[task1->len - 1] == task2->out[4]) {
+            task1->len -= 5;
+            int run1 = *(int*)(task1->out + task1->len);
+            int run2 = *(int*)(task2->out);
+            *(int*)(task2->out) = run1 + run2;
+        }
+        fwrite(task1->out, task1->len, 1, stdout);
     }
-    fwrite(out, cursor, 1, stdout);
+    fwrite(tasks[i]->out, tasks[i]->len, 1, stdout);
     return EXIT_SUCCESS;
 }
