@@ -1,4 +1,5 @@
 .cache
+tests
 tests-out
 compile_commands.json
 pzip
