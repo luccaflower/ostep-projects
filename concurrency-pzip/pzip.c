@@ -1,6 +1,8 @@
 #include <assert.h>
+#include <bits/pthreadtypes.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,16 +80,44 @@ Malloc(size_t size)
     return ret;
 }
 
+void
+Pthread_create(pthread_t* thread,
+               pthread_attr_t* attr,
+               void*(fn)(void*),
+               void* arg)
+{
+    int err = pthread_create(thread, attr, fn, arg);
+    if (err) {
+        unix_error("pthread_create", err);
+    }
+}
+
+void
+Pthread_join(pthread_t p, void** ret)
+{
+    int err = pthread_join(p, ret);
+    if (err) {
+        unix_error("pthread_join", err);
+    }
+}
+
 struct WorkTask
+{
+    size_t len;
+    char* in;
+};
+struct WorkResult
 {
     size_t len;
     char out[];
 };
 
-struct WorkTask*
-zip(char* buf, size_t buf_len)
+struct WorkResult*
+zip(struct WorkTask* request)
 {
-    struct WorkTask* task = Malloc(sizeof(*task) + 5 * buf_len);
+    size_t buf_len = request->len;
+    char* buf = request->in;
+    struct WorkResult* task = Malloc(sizeof(*task) + 5 * buf_len);
     char* out = task->out;
     size_t cursor = 0;
     size_t count = 0;
@@ -115,7 +145,13 @@ zip(char* buf, size_t buf_len)
     task->len = cursor;
     return task;
 }
+void*
+zip_thread(void* arg)
+{
+    return (void*)zip((struct WorkTask*)arg);
+}
 
+#define THREADS (16)
 int
 main(int argc, char* argv[])
 {
@@ -124,19 +160,39 @@ main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    struct WorkTask* tasks[argc - 1];
+    size_t task_len = (argc - 1) * THREADS;
+    struct WorkResult* tasks[task_len];
+    pthread_t threads[THREADS];
     for (size_t i = 1; i < argc; i++) {
         int fd = Open(argv[1], O_RDONLY);
         struct stat filestat;
         Fstat(fd, &filestat);
         char* buf = Mmap(NULL, filestat.st_size, PROT_READ, MAP_SHARED, fd, 0);
-        tasks[i - 1] = zip(buf, filestat.st_size);
+
+        size_t per_thread = filestat.st_size / THREADS;
+        size_t mod = filestat.st_size % THREADS;
+        for (size_t j = 0; j < mod; j++) {
+            struct WorkTask* task = Malloc(sizeof(*task));
+            task->len = per_thread + 1;
+            task->in = buf + (per_thread + 1) * j;
+            Pthread_create(&threads[j], NULL, zip_thread, task);
+        }
+        size_t covered = (per_thread + 1) * mod;
+        for (size_t j = 0; j < THREADS - mod; j++) {
+            struct WorkTask* task = Malloc(sizeof(*task));
+            task->len = per_thread;
+            task->in = buf + covered + per_thread * j;
+            Pthread_create(&threads[j + mod], NULL, zip_thread, task);
+        }
+        for (size_t j = 0; j < THREADS; j++) {
+            Pthread_join(threads[j], (void*)&tasks[(i - 1) * THREADS + j]);
+        }
         close(fd);
     }
     size_t i = 0;
-    for (; i < argc - 2; i++) {
-        struct WorkTask* task1 = tasks[i];
-        struct WorkTask* task2 = tasks[i + 1];
+    for (; i < task_len - 1; i++) {
+        struct WorkResult* task1 = tasks[i];
+        struct WorkResult* task2 = tasks[i + 1];
         if (task1->out[task1->len - 1] == task2->out[4]) {
             task1->len -= 5;
             int run1 = *(int*)(task1->out + task1->len);
