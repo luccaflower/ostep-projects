@@ -81,6 +81,16 @@ Malloc(size_t size)
     return ret;
 }
 
+void*
+Realloc(void* ptr, size_t newsize)
+{
+    char* ret = realloc(ptr, newsize);
+    if (!ret) {
+        unix_error("realloc", errno);
+    }
+    return ret;
+}
+
 void
 Pthread_create(pthread_t* thread,
                pthread_attr_t* attr,
@@ -159,6 +169,35 @@ struct WorkResult
     size_t len;
     char out[];
 };
+struct WorkResultList
+{
+    size_t capacity;
+    size_t len;
+    struct WorkResult* list[];
+};
+
+struct WorkResultList*
+List_new(size_t initial_capacity)
+{
+    struct WorkResultList* list =
+      Malloc(sizeof(*list) + initial_capacity * sizeof(*list->list));
+    list->len = 0;
+    list->capacity = initial_capacity;
+    return list;
+}
+
+void
+List_add(struct WorkResult* result, struct WorkResultList** list)
+{
+    if ((*list)->capacity >= (*list)->len) {
+        size_t new_capacity = (*list)->capacity * 2;
+        *list = Realloc(*list,
+                        sizeof(**list) + new_capacity * sizeof(*(*list)->list));
+        (*list)->capacity = new_capacity;
+    }
+    (*list)->list[(*list)->len++] = result;
+}
+
 struct WorkTask
 {
     size_t len;
@@ -180,12 +219,12 @@ struct WorkContext
 };
 
 void
-init_work_context(struct WorkContext* context, size_t all_tasks)
+init_work_context(struct WorkContext* context)
 {
     context->produceptr = 0;
     context->consumeptr = 0;
     context->waiting_count = 0;
-    context->all_tasks = all_tasks;
+    context->all_tasks = 0;
     pthread_mutex_init(&context->lock, NULL);
     Pthread_cond_init(&context->empty, NULL);
     Pthread_cond_init(&context->fill, NULL);
@@ -202,6 +241,7 @@ put_task(struct WorkContext* context, struct WorkTask* task)
     context->buffer[context->produceptr] = task;
     context->produceptr = (context->produceptr + 1) % MAX;
     context->waiting_count++;
+    context->all_tasks++;
     Pthread_cond_signal(&context->fill);
     Pthread_mutex_unlock(&context->lock);
 }
@@ -268,8 +308,8 @@ zip_consumer(void* arg)
     while (1) {
         struct WorkTask* task = consume_task(context);
         zip(task);
-        context->done_count++;
         Pthread_mutex_lock(&context->lock);
+        context->done_count++;
         if (context->done_count == context->all_tasks) {
             Pthread_cond_signal(&context->done);
         }
@@ -287,6 +327,7 @@ merge(struct WorkResult* task1, struct WorkResult* task2)
     task1->status = MERGED;
 }
 
+#define CHUNK_SIZE (MB(64))
 int
 main(int argc, char* argv[])
 {
@@ -296,10 +337,9 @@ main(int argc, char* argv[])
     }
     size_t task_len = (argc - 1) * THREADS;
     struct WorkContext* context = Malloc(sizeof(*context));
-    init_work_context(context, task_len);
+    init_work_context(context);
 
-    struct WorkResult* results[task_len];
-    pthread_t threads[THREADS];
+    struct WorkResultList* result_list = List_new(32);
     pthread_t consumers[THREADS];
     for (size_t i = 0; i < THREADS; i++) {
         Pthread_create(&consumers[i], NULL, zip_consumer, context);
@@ -309,31 +349,32 @@ main(int argc, char* argv[])
         struct stat filestat;
         Fstat(fd, &filestat);
         char* buf = Mmap(NULL, filestat.st_size, PROT_READ, MAP_SHARED, fd, 0);
-
-        size_t per_thread = filestat.st_size / THREADS;
-        size_t mod = filestat.st_size % THREADS;
-        for (size_t j = 0; j < mod; j++) {
+        size_t even_chunks = filestat.st_size / CHUNK_SIZE;
+        size_t final_chunk = filestat.st_size % CHUNK_SIZE;
+        size_t total_chunks = even_chunks + (final_chunk == 0 ? 0 : 1);
+        for (size_t j = 0; j < even_chunks; j++) {
             struct WorkTask* task = Malloc(sizeof(*task));
-            task->len = per_thread + 1;
-            task->in = buf + (per_thread + 1) * j;
+            task->len = CHUNK_SIZE;
+            task->in = buf + CHUNK_SIZE * j;
             struct WorkResult* result =
-              Malloc(sizeof(*task) + 5 * (per_thread + 1));
+              Malloc(sizeof(*result) + 5 * CHUNK_SIZE);
             result->status = NOT_STARTED;
             task->result = result;
-            results[(i - 1) * THREADS + j] = result;
+            List_add(result, &result_list);
             put_task(context, task);
         }
-        size_t covered = (per_thread + 1) * mod;
-        for (size_t j = 0; j < THREADS - mod; j++) {
+        if (final_chunk) {
             struct WorkTask* task = Malloc(sizeof(*task));
-            task->len = per_thread;
-            task->in = buf + covered + per_thread * j;
-            struct WorkResult* result = Malloc(sizeof(*task) + 5 * per_thread);
+            task->len = final_chunk;
+            task->in = buf + CHUNK_SIZE * even_chunks;
+            struct WorkResult* result =
+              Malloc(sizeof(*result) + 5 * final_chunk);
             result->status = NOT_STARTED;
             task->result = result;
-            results[(i - 1) * THREADS + j + mod] = result;
+            List_add(result, &result_list);
             put_task(context, task);
         }
+
         close(fd);
     }
     Pthread_mutex_lock(&context->lock);
@@ -342,9 +383,9 @@ main(int argc, char* argv[])
     }
     Pthread_mutex_unlock(&context->lock);
     size_t i = 0;
-    for (; i < task_len - 1; i++) {
-        struct WorkResult* task1 = results[i];
-        struct WorkResult* task2 = results[i + 1];
+    for (; i < result_list->len - 1; i++) {
+        struct WorkResult* task1 = result_list->list[i];
+        struct WorkResult* task2 = result_list->list[i + 1];
         if (task1->status == WAITING_FOR_MERGE &&
             task2->status == WAITING_FOR_MERGE &&
             task1->out[task1->len - 1] == task2->out[4]) {
@@ -353,6 +394,7 @@ main(int argc, char* argv[])
         fwrite(task1->out, task1->len, 1, stdout);
         task1->status = PRINTED;
     }
-    fwrite(results[i]->out, results[i]->len, 1, stdout);
+    struct WorkResult* last = result_list->list[i];
+    fwrite(last->out, last->len, 1, stdout);
     return EXIT_SUCCESS;
 }
