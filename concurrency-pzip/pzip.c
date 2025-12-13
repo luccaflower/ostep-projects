@@ -15,6 +15,7 @@
 #define KB(x) ((size_t)x * 1024)
 #define MB(x) (KB(x) * 1024)
 #define GB(x) (MB(x) * 1024)
+#define THREADS (16)
 
 void
 unix_error(char* const message, int err)
@@ -37,7 +38,7 @@ int
 Open(char* const name, const int mode)
 {
     int fd = open(name, O_RDONLY);
-    if (!fd) {
+    if (fd < 0) {
         unix_error("open", errno);
     }
     return fd;
@@ -101,24 +102,132 @@ Pthread_join(pthread_t p, void** ret)
     }
 }
 
+void
+Pthread_mutex_lock(pthread_mutex_t* lock)
+{
+    int err = pthread_mutex_lock(lock);
+    if (err) {
+        unix_error("pthread_mutex_lock", err);
+    }
+}
+void
+Pthread_mutex_unlock(pthread_mutex_t* lock)
+{
+    int err = pthread_mutex_unlock(lock);
+    if (err) {
+        unix_error("pthread_mutex_unlock", err);
+    }
+}
+
+void
+Pthread_cond_init(pthread_cond_t* cond, pthread_condattr_t* attr)
+{
+    int err = pthread_cond_init(cond, attr);
+    if (err) {
+        unix_error("pthread_cond_init", err);
+    }
+}
+
+void
+Pthread_cond_signal(pthread_cond_t* cond)
+{
+    int err = pthread_cond_signal(cond);
+    if (err) {
+        unix_error("pthread_cond_signal", err);
+    }
+}
+
+void
+Pthread_cond_wait(pthread_cond_t* cond, pthread_mutex_t* lock)
+{
+    int err = pthread_cond_wait(cond, lock);
+    if (err) {
+        unix_error("pthread_cond_wait", err);
+    }
+}
+
+enum WorkStatus
+{
+    NOT_STARTED,
+    WAITING_FOR_MERGE,
+    MERGED,
+    PRINTED
+};
+struct WorkResult
+{
+    enum WorkStatus status;
+    size_t len;
+    char out[];
+};
 struct WorkTask
 {
     size_t len;
     char* in;
-};
-struct WorkResult
-{
-    size_t len;
-    char out[];
+    struct WorkResult* result;
 };
 
-struct WorkResult*
+#define MAX (8)
+struct WorkContext
+{
+    pthread_cond_t empty, fill, done;
+    pthread_mutex_t lock;
+    size_t produceptr;
+    size_t consumeptr;
+    size_t waiting_count;
+    size_t done_count;
+    size_t all_tasks;
+    struct WorkTask* buffer[MAX];
+};
+
+void
+init_work_context(struct WorkContext* context, size_t all_tasks)
+{
+    context->produceptr = 0;
+    context->consumeptr = 0;
+    context->waiting_count = 0;
+    context->all_tasks = all_tasks;
+    pthread_mutex_init(&context->lock, NULL);
+    Pthread_cond_init(&context->empty, NULL);
+    Pthread_cond_init(&context->fill, NULL);
+    Pthread_cond_init(&context->done, NULL);
+}
+
+void
+put_task(struct WorkContext* context, struct WorkTask* task)
+{
+    Pthread_mutex_lock(&context->lock);
+    while (context->waiting_count == MAX) {
+        Pthread_cond_wait(&context->empty, &context->lock);
+    }
+    context->buffer[context->produceptr] = task;
+    context->produceptr = (context->produceptr + 1) % MAX;
+    context->waiting_count++;
+    Pthread_cond_signal(&context->fill);
+    Pthread_mutex_unlock(&context->lock);
+}
+
+struct WorkTask*
+consume_task(struct WorkContext* context)
+{
+    Pthread_mutex_lock(&context->lock);
+    while (context->waiting_count == 0) {
+        Pthread_cond_wait(&context->fill, &context->lock);
+    }
+    struct WorkTask* task = context->buffer[context->consumeptr];
+    context->consumeptr = (context->consumeptr + 1) % MAX;
+    context->waiting_count--;
+    Pthread_cond_signal(&context->empty);
+    Pthread_mutex_unlock(&context->lock);
+    return task;
+}
+
+void
 zip(struct WorkTask* request)
 {
     size_t buf_len = request->len;
     char* buf = request->in;
-    struct WorkResult* task = Malloc(sizeof(*task) + 5 * buf_len);
-    char* out = task->out;
+    struct WorkResult* result = request->result;
+    char* out = result->out;
     size_t cursor = 0;
     size_t count = 0;
     char current = '\0';
@@ -142,16 +251,42 @@ zip(struct WorkTask* request)
         out[cursor++] = current;
     }
 
-    task->len = cursor;
-    return task;
+    result->len = cursor;
+    result->status = WAITING_FOR_MERGE;
 }
 void*
 zip_thread(void* arg)
 {
-    return (void*)zip((struct WorkTask*)arg);
+    zip((struct WorkTask*)arg);
+    return NULL;
 }
 
-#define THREADS (16)
+void*
+zip_consumer(void* arg)
+{
+    struct WorkContext* context = (struct WorkContext*)arg;
+    while (1) {
+        struct WorkTask* task = consume_task(context);
+        zip(task);
+        context->done_count++;
+        Pthread_mutex_lock(&context->lock);
+        if (context->done_count == context->all_tasks) {
+            Pthread_cond_signal(&context->done);
+        }
+        Pthread_mutex_unlock(&context->lock);
+    }
+}
+
+void
+merge(struct WorkResult* task1, struct WorkResult* task2)
+{
+    task1->len -= 5;
+    int run1 = *(int*)(task1->out + task1->len);
+    int run2 = *(int*)(task2->out);
+    *(int*)(task2->out) = run1 + run2;
+    task1->status = MERGED;
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -159,10 +294,16 @@ main(int argc, char* argv[])
         puts("pzip: file1 [file2 ...]");
         return EXIT_FAILURE;
     }
-
     size_t task_len = (argc - 1) * THREADS;
-    struct WorkResult* tasks[task_len];
+    struct WorkContext* context = Malloc(sizeof(*context));
+    init_work_context(context, task_len);
+
+    struct WorkResult* results[task_len];
     pthread_t threads[THREADS];
+    pthread_t consumers[THREADS];
+    for (size_t i = 0; i < THREADS; i++) {
+        Pthread_create(&consumers[i], NULL, zip_consumer, context);
+    }
     for (size_t i = 1; i < argc; i++) {
         int fd = Open(argv[1], O_RDONLY);
         struct stat filestat;
@@ -175,32 +316,43 @@ main(int argc, char* argv[])
             struct WorkTask* task = Malloc(sizeof(*task));
             task->len = per_thread + 1;
             task->in = buf + (per_thread + 1) * j;
-            Pthread_create(&threads[j], NULL, zip_thread, task);
+            struct WorkResult* result =
+              Malloc(sizeof(*task) + 5 * (per_thread + 1));
+            result->status = NOT_STARTED;
+            task->result = result;
+            results[(i - 1) * THREADS + j] = result;
+            put_task(context, task);
         }
         size_t covered = (per_thread + 1) * mod;
         for (size_t j = 0; j < THREADS - mod; j++) {
             struct WorkTask* task = Malloc(sizeof(*task));
             task->len = per_thread;
             task->in = buf + covered + per_thread * j;
-            Pthread_create(&threads[j + mod], NULL, zip_thread, task);
-        }
-        for (size_t j = 0; j < THREADS; j++) {
-            Pthread_join(threads[j], (void*)&tasks[(i - 1) * THREADS + j]);
+            struct WorkResult* result = Malloc(sizeof(*task) + 5 * per_thread);
+            result->status = NOT_STARTED;
+            task->result = result;
+            results[(i - 1) * THREADS + j + mod] = result;
+            put_task(context, task);
         }
         close(fd);
     }
+    Pthread_mutex_lock(&context->lock);
+    while (context->done_count < context->all_tasks) {
+        Pthread_cond_wait(&context->done, &context->lock);
+    }
+    Pthread_mutex_unlock(&context->lock);
     size_t i = 0;
     for (; i < task_len - 1; i++) {
-        struct WorkResult* task1 = tasks[i];
-        struct WorkResult* task2 = tasks[i + 1];
-        if (task1->out[task1->len - 1] == task2->out[4]) {
-            task1->len -= 5;
-            int run1 = *(int*)(task1->out + task1->len);
-            int run2 = *(int*)(task2->out);
-            *(int*)(task2->out) = run1 + run2;
+        struct WorkResult* task1 = results[i];
+        struct WorkResult* task2 = results[i + 1];
+        if (task1->status == WAITING_FOR_MERGE &&
+            task2->status == WAITING_FOR_MERGE &&
+            task1->out[task1->len - 1] == task2->out[4]) {
+            merge(task1, task2);
         }
         fwrite(task1->out, task1->len, 1, stdout);
+        task1->status = PRINTED;
     }
-    fwrite(tasks[i]->out, tasks[i]->len, 1, stdout);
+    fwrite(results[i]->out, results[i]->len, 1, stdout);
     return EXIT_SUCCESS;
 }
